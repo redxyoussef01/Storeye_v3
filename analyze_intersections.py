@@ -6,6 +6,13 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 from collections import defaultdict, Counter
 from datetime import datetime
+from typing import Dict as _DictType
+
+try:
+    # Optional import; analysis should still run without backend configured
+    from serve_event_client import ServeEventClient
+except Exception:  # noqa: BLE001
+    ServeEventClient = None  # type: ignore
 
 # ---- Configuration (edit these variables) ----
 # Input directory (object classification outputs)
@@ -516,6 +523,61 @@ def save_detailed_results(results: Dict, output_folder: Path):
     print(f"  Saved detailed results to: {output_folder}")
 
 
+def _emit_serve_events_for_folder(results: _DictType, video_metadata: _DictType) -> int:
+    """Send ServeEvent(s) to backend for this hand folder if configured.
+
+    Maps detected classes to product codes and emits one event per counted item.
+    """
+    if ServeEventClient is None:
+        return 0
+
+    client = ServeEventClient()
+    if not client.is_configured():
+        return 0
+
+    class_distribution: dict = results.get("folder_class_distribution", {}) or {}
+    if not class_distribution:
+        return 0
+
+    # Map model class names to your productCode values used by backend
+    # Adjust the mapping to your domain codes
+    CLASS_TO_PRODUCT_CODE = {
+        # examples:
+        "coffee": "coffee",
+        "the": "the",
+        # add more class_name -> productCode as needed
+    }
+
+    # Derive a timestamp from the video start if parsable; fallback to now
+    ts_iso = video_metadata.get("start_date_iso") or video_metadata.get("start_date")
+    try:
+        base_dt = datetime.fromisoformat(ts_iso) if ts_iso else datetime.now()
+    except Exception:  # noqa: BLE001
+        base_dt = datetime.now()
+    base_ms = int(base_dt.timestamp() * 1000)
+
+    events: list[dict] = []
+    offset_ms = 0
+    for class_name, count in class_distribution.items():
+        product_code = CLASS_TO_PRODUCT_CODE.get(class_name)
+        if not product_code:
+            continue
+        # Emit one event per counted instance to match backend shape
+        for _ in range(int(count)):
+            events.append({
+                "timestamp": base_ms + offset_ms,
+                "productCode": product_code,
+            })
+            # small offset to keep uniqueness, 1 ms per event
+            offset_ms += 1
+
+    if not events:
+        return 0
+
+    sent = client.send_many(events)
+    return sent
+
+
 def main():
     """Main function to analyze all object classification folders"""
     print(f"Starting intersection analysis...")
@@ -637,6 +699,14 @@ def main():
                         print(f"  Successfully created JSON summary for {hand_folder.name}")
                     except Exception as e:
                         print(f"  Error creating JSON summary for {hand_folder.name}: {e}")
+
+                    # Emit ServeEvent(s) to backend if configured
+                    try:
+                        sent_cnt = _emit_serve_events_for_folder(results, video_metadata)
+                        if sent_cnt:
+                            print(f"  Emitted {sent_cnt} ServeEvent(s) to backend for {hand_folder.name}")
+                    except Exception as e:  # noqa: BLE001
+                        print(f"  Warning: failed to emit ServeEvent(s) for {hand_folder.name}: {e}")
                     
             except Exception as e:
                 print(f"Error processing hand folder {hand_folder}: {e}")
